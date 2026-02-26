@@ -4,6 +4,7 @@ mod admin;
 mod analytics;
 mod categories;
 mod collaboration;
+mod contests;
 mod errors;
 mod events;
 mod expiry;
@@ -19,16 +20,17 @@ mod templates;
 mod types;
 mod combos;
 mod test_combos;
+mod versioning;
 
 use admin::{
     get_admin, get_admin_config, init_admin, is_trading_paused, require_not_paused,
     AdminConfig, PauseInfo,
 };
 use categories::{RiskLevel, SignalCategory};
-use errors::{AdminError, TemplateError};
+use errors::{AdminError, TemplateError, ContestError, VersioningError};
 pub use leaderboard::{get_leaderboard as get_leaderboard_internal, LeaderboardMetric, ProviderLeaderboard};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Map, String, Vec};
-use stellarswipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
+use stellar_swipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
 use templates::{SignalTemplate, DEFAULT_TEMPLATE_EXPIRY_HOURS};
 use types::{
     Asset, FeeBreakdown, ImportResultView, ProviderPerformance, Signal, SignalAction,
@@ -42,6 +44,10 @@ use combos::{
     ComponentSignal,
 };
 use errors::ComboError;
+use contests::{
+    Contest, ContestEntry, ContestMetric, ContestStatus,
+};
+use versioning::{SignalVersion, CopyRecord};
 
 const MAX_EXPIRY_SECONDS: u64 = 30 * 24 * 60 * 60;
 
@@ -337,6 +343,9 @@ impl SignalRegistry {
             // Collaboration field
             is_collaborative: false,
         };
+
+        // Auto-enter signal into active contests (before moving signal)
+        let _ = contests::auto_enter_signal(env, &signal);
 
         // Store signal
         let mut signals = Self::get_signals_map(env);
@@ -1177,6 +1186,111 @@ impl SignalRegistry {
     pub fn get_combo_executions(env: Env, combo_id: u64) -> Vec<ComboExecution> {
         get_combo_executions_pub(&env, combo_id)
     }
+
+    /* =========================
+       CONTEST FUNCTIONS
+    ========================== */
+
+    /// Create a new contest
+    pub fn create_contest(
+        env: Env,
+        admin: Address,
+        name: String,
+        start_time: u64,
+        end_time: u64,
+        metric: ContestMetric,
+        min_signals: u32,
+        prize_pool: i128,
+    ) -> Result<u64, ContestError> {
+        admin.require_auth();
+        require_not_paused(&env)?;
+        contests::create_contest(&env, name, start_time, end_time, metric, min_signals, prize_pool)
+    }
+
+    /// Finalize a contest and distribute prizes
+    pub fn finalize_contest(env: Env, contest_id: u64) -> Result<Vec<Address>, ContestError> {
+        contests::finalize_contest(&env, contest_id)
+    }
+
+    /// Get contest details
+    pub fn get_contest(env: Env, contest_id: u64) -> Result<Contest, ContestError> {
+        contests::get_contest(&env, contest_id)
+    }
+
+    /// Get all active contests
+    pub fn get_active_contests(env: Env) -> Vec<u64> {
+        contests::get_active_contests(&env)
+    }
+
+    /// Get contest leaderboard
+    pub fn get_contest_leaderboard(env: Env, contest_id: u64) -> Result<Vec<ContestEntry>, ContestError> {
+        contests::get_contest_leaderboard(&env, contest_id)
+    }
+
+    /// Get provider's prize for a contest
+    pub fn get_provider_prize(env: Env, contest_id: u64, provider: Address) -> i128 {
+        contests::get_provider_prize(&env, contest_id, provider)
+    }
+
+    /* =========================
+       VERSIONING FUNCTIONS
+    ========================== */
+
+    /// Update an active signal
+    pub fn update_signal(
+        env: Env,
+        signal_id: u64,
+        updater: Address,
+        new_price: Option<i128>,
+        new_rationale: Option<String>,
+        new_expiry: Option<u64>,
+    ) -> Result<u32, VersioningError> {
+        updater.require_auth();
+        let mut signals = Self::get_signals_map(&env);
+        let mut signal = signals.get(signal_id).ok_or(VersioningError::VersionNotFound)?;
+        
+        let new_version = versioning::update_signal(
+            &env,
+            signal_id,
+            &updater,
+            new_price,
+            new_rationale,
+            new_expiry,
+            &mut signal,
+        )?;
+        
+        signals.set(signal_id, signal);
+        Self::save_signals_map(&env, &signals);
+        
+        Ok(new_version)
+    }
+
+    /// Get version history for a signal
+    pub fn get_signal_history(env: Env, signal_id: u64) -> Vec<SignalVersion> {
+        versioning::get_signal_history(&env, signal_id)
+    }
+
+    /// Record when a user copies a signal
+    pub fn record_signal_copy(env: Env, user: Address, signal_id: u64) {
+        user.require_auth();
+        let version = versioning::get_latest_version(&env, signal_id);
+        versioning::record_copy(&env, &user, signal_id, version);
+    }
+
+    /// Get pending updates for a user's copied signal
+    pub fn get_pending_updates(env: Env, user: Address, signal_id: u64) -> Vec<u32> {
+        versioning::get_pending_updates(&env, &user, signal_id)
+    }
+
+    /// Get copy record for a user
+    pub fn get_copy_record(env: Env, user: Address, signal_id: u64) -> Option<CopyRecord> {
+        versioning::get_copy_record(&env, &user, signal_id)
+    }
+
+    /// Mark user as notified of an update
+    pub fn mark_update_notified(env: Env, user: Address, signal_id: u64, version: u32) {
+        versioning::mark_notified(&env, &user, signal_id, version);
+    }
 }
 
 /*mod test;
@@ -1187,3 +1301,5 @@ mod test_import;
 mod test_performance;
 mod test_collaboration; */
 mod test_scheduling;
+mod test_contests;
+mod test_versioning;
