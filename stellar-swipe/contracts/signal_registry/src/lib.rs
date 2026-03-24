@@ -4,6 +4,7 @@ mod admin;
 mod analytics;
 mod categories;
 mod collaboration;
+mod combos;
 mod contests;
 mod errors;
 mod events;
@@ -19,26 +20,35 @@ mod social;
 mod stake;
 mod submission;
 mod templates;
-mod types;
-mod combos;
 mod test_combos;
+mod types;
 mod versioning;
 
 use admin::{
-    get_admin, get_admin_config, init_admin, is_trading_paused, require_not_paused,
-    AdminConfig, PauseInfo,
+    get_admin, get_admin_config, init_admin, is_trading_paused, require_not_paused, AdminConfig,
+    PauseInfo,
 };
 use categories::{RiskLevel, SignalCategory};
-use errors::{AdminError, TemplateError, ContestError, VersioningError};
-pub use leaderboard::{get_leaderboard as get_leaderboard_internal, LeaderboardMetric, ProviderLeaderboard};
+use combos::{
+    cancel_combo, create_combo_signal, execute_combo_signal, get_combo, get_combo_executions_pub,
+    get_combo_performance, ComboExecution, ComboPerformanceSummary, ComboSignal, ComboType,
+    ComponentExecution, ComponentSignal,
+};
+use contests::{Contest, ContestEntry, ContestMetric, ContestStatus};
+use errors::ComboError;
+use errors::{AdminError, ContestError, TemplateError, VersioningError};
+pub use leaderboard::{
+    get_leaderboard as get_leaderboard_internal, LeaderboardMetric, ProviderLeaderboard,
+};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Map, String, Vec};
 use stellar_swipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
 use templates::{SignalTemplate, DEFAULT_TEMPLATE_EXPIRY_HOURS};
 use types::{
-    Asset, FeeBreakdown, ImportResultView, ProviderPerformance, Signal, SignalAction,
-    SignalPerformanceView, SignalStatus, SignalSummary, SortOption, TradeExecution,
-    SignalData, RecurrencePattern,
+    Asset, FeeBreakdown, ImportResultView, ProviderPerformance, RecurrencePattern, Signal,
+    SignalAction, SignalData, SignalPerformanceView, SignalStatus, SignalSummary, SortOption,
+    TradeExecution,
 };
+ trust-score-system
 use combos::{
     cancel_combo, create_combo_signal, execute_combo_signal, get_combo,
     get_combo_executions_pub, get_combo_performance, ComboExecution,
@@ -51,6 +61,9 @@ use contests::{
 };
 use versioning::{SignalVersion, CopyRecord};
 use reputation::{calculate_trust_score, get_trust_score, update_trust_score, update_median_values, TrustScoreDetails, TrustScoreTier};
+
+use versioning::{CopyRecord, SignalVersion};
+ main
 
 const MAX_EXPIRY_SECONDS: u64 = 30 * 24 * 60 * 60;
 
@@ -68,8 +81,8 @@ pub enum StorageKey {
     Templates,
     ExternalIdMappings,
     ComboCounter,
-Combos,
-ComboExecutions(u64),
+    Combos,
+    ComboExecutions(u64),
 }
 
 #[contractimpl]
@@ -120,7 +133,7 @@ impl SignalRegistry {
         get_admin(&env)
     }
 
-   pub fn schedule(
+    pub fn schedule(
         env: Env,
         provider: Address,
         signal_data: SignalData,
@@ -134,7 +147,11 @@ impl SignalRegistry {
         scheduling::publish_scheduled_signals(env)
     }
 
-    pub fn cancel_schedule(env: Env, provider: Address, schedule_id: u64) -> Result<(), AdminError> {
+    pub fn cancel_schedule(
+        env: Env,
+        provider: Address,
+        schedule_id: u64,
+    ) -> Result<(), AdminError> {
         scheduling::cancel_scheduled_signal(env, provider, schedule_id)
     }
 
@@ -288,7 +305,10 @@ impl SignalRegistry {
         risk_level: RiskLevel,
     ) -> Result<u64, AdminError> {
         provider.require_auth();
-        Self::create_signal_internal(&env, provider, asset_pair, action, price, rationale, expiry, category, tags, risk_level)
+        Self::create_signal_internal(
+            &env, provider, asset_pair, action, price, rationale, expiry, category, tags,
+            risk_level,
+        )
     }
 
     fn create_signal_internal(
@@ -307,7 +327,7 @@ impl SignalRegistry {
         require_not_paused(env)?;
 
         Self::validate_asset_pair(env, &asset_pair)?;
-        
+
         // Validate and deduplicate tags
         categories::validate_tags(&tags)?;
         let unique_tags = categories::deduplicate_tags(env, tags);
@@ -354,7 +374,7 @@ impl SignalRegistry {
         let mut signals = Self::get_signals_map(env);
         signals.set(id, signal);
         Self::save_signals_map(env, &signals);
-        
+
         // Update tag popularity
         categories::increment_tag_popularity(env, &unique_tags);
 
@@ -475,22 +495,14 @@ impl SignalRegistry {
         if expiry > env.ledger().timestamp() + MAX_EXPIRY_SECONDS {
             return Err(TemplateError::InvalidExpiry);
         }
-        
+
         // Default category, tags, and risk_level for templates
         let category = SignalCategory::SwingTrade;
         let tags = Vec::new(&env);
         let risk_level = RiskLevel::Medium;
 
-       let signal_id = Self::create_signal_internal(
-            &env,
-            submitter,
-            asset_pair,
-            action,
-            price,
-            rationale,
-            expiry,
-            category,
-            tags,
+        let signal_id = Self::create_signal_internal(
+            &env, submitter, asset_pair, action, price, rationale, expiry, category, tags,
             risk_level,
         )
         .map_err(|_| TemplateError::InvalidTemplate)?;
@@ -811,8 +823,7 @@ impl SignalRegistry {
         expiry::count_signals_pending_expiry(&env, &signals)
     }
 
-
-     //  ANALYTICS FUNCTIONS
+    //  ANALYTICS FUNCTIONS
 
     /// Get provider analytics (requires min 10 signals)
     pub fn get_provider_analytics(
@@ -834,11 +845,11 @@ impl SignalRegistry {
         let signals = Self::get_signals_map(&env);
         analytics::calculate_global_analytics(&env, &signals)
     }
-    
+
     /* =========================
        CATEGORIZATION & TAGGING FUNCTIONS
     ========================== */
-    
+
     /// Add tags to an existing signal
     pub fn add_tags_to_signal(
         env: Env,
@@ -847,23 +858,23 @@ impl SignalRegistry {
         tags: Vec<String>,
     ) -> Result<(), AdminError> {
         provider.require_auth();
-        
+
         let mut signals = Self::get_signals_map(&env);
         let mut signal = signals.get(signal_id).ok_or(AdminError::InvalidParameter)?;
-        
+
         // Verify provider owns the signal
         if signal.provider != provider {
             return Err(AdminError::Unauthorized);
         }
-        
+
         // Validate new tags
         categories::validate_tags(&tags)?;
-        
+
         // Check total tag count
         if signal.tags.len() + tags.len() > 10 {
             return Err(AdminError::InvalidParameter);
         }
-        
+
         // Add tags (deduplicate)
         let mut combined = Vec::new(&env);
         for i in 0..signal.tags.len() {
@@ -872,21 +883,21 @@ impl SignalRegistry {
         for i in 0..tags.len() {
             combined.push_back(tags.get(i).unwrap());
         }
-        
+
         signal.tags = categories::deduplicate_tags(&env, combined);
         let tag_count = signal.tags.len();
         signals.set(signal_id, signal);
         Self::save_signals_map(&env, &signals);
-        
+
         // Update tag popularity
         categories::increment_tag_popularity(&env, &tags);
-        
+
         // Emit event
         events::emit_tags_added(&env, signal_id, provider, tag_count);
-        
+
         Ok(())
     }
-    
+
     /// Get signals filtered by categories, tags, and risk levels
     pub fn get_signals_filtered(
         env: Env,
@@ -899,7 +910,7 @@ impl SignalRegistry {
         let signals_map = Self::get_signals_map(&env);
         let mut filtered = Vec::new(&env);
         let now = env.ledger().timestamp();
-        
+
         // Collect active signals
         for key in signals_map.keys() {
             if let Some(signal) = signals_map.get(key) {
@@ -908,7 +919,7 @@ impl SignalRegistry {
                 }
             }
         }
-        
+
         // Filter by categories
         if let Some(cats) = categories {
             let mut temp = Vec::new(&env);
@@ -923,7 +934,7 @@ impl SignalRegistry {
             }
             filtered = temp;
         }
-        
+
         // Filter by tags (any match)
         if let Some(tags_filter) = tags {
             let mut temp = Vec::new(&env);
@@ -948,7 +959,7 @@ impl SignalRegistry {
             }
             filtered = temp;
         }
-        
+
         // Filter by risk levels
         if let Some(risks) = risk_levels {
             let mut temp = Vec::new(&env);
@@ -963,25 +974,25 @@ impl SignalRegistry {
             }
             filtered = temp;
         }
-        
+
         // Paginate
         let total = filtered.len();
         let start = offset.min(total);
         let end = (offset + limit).min(total);
-        
+
         let mut result = Vec::new(&env);
         for i in start..end {
             result.push_back(filtered.get(i).unwrap());
         }
-        
+
         result
     }
-    
+
     /// Get popular tags
     pub fn get_popular_tags(env: Env, limit: u32) -> Vec<(String, u32)> {
         categories::get_popular_tags(&env, limit)
     }
-    
+
     /// Auto-suggest tags based on signal rationale
     pub fn suggest_tags(env: Env, rationale: String) -> Vec<String> {
         categories::auto_suggest_tags(&env, &rationale)
@@ -1139,13 +1150,10 @@ impl SignalRegistry {
     ) -> Result<u64, ComboError> {
         provider.require_auth();
 
-        let combo_id =
-            create_combo_signal(&env, &provider, name, components, combo_type)?;
+        let combo_id = create_combo_signal(&env, &provider, name, components, combo_type)?;
 
         events::emit_combo_created(
-            &env,
-            combo_id,
-            provider,
+            &env, combo_id, provider,
             // component count already validated inside create_combo_signal
             combo_id, // placeholder — use actual count below
         );
@@ -1163,16 +1171,16 @@ impl SignalRegistry {
     ) -> Result<Vec<ComponentExecution>, ComboError> {
         user.require_auth();
 
-        let executions =
-            execute_combo_signal(&env, combo_id, &user, total_amount)?;
+        let executions = execute_combo_signal(&env, combo_id, &user, total_amount)?;
 
         // Calculate combined ROI for the event (already stored, re-derive for event)
         let execs_stored = get_combo_executions_pub(&env, combo_id);
-        let combined_roi = if let Some(last) = execs_stored.get(execs_stored.len().saturating_sub(1)) {
-            last.combined_roi
-        } else {
-            0
-        };
+        let combined_roi =
+            if let Some(last) = execs_stored.get(execs_stored.len().saturating_sub(1)) {
+                last.combined_roi
+            } else {
+                0
+            };
 
         events::emit_combo_executed(&env, combo_id, user, combined_roi);
 
@@ -1223,7 +1231,15 @@ impl SignalRegistry {
     ) -> Result<u64, ContestError> {
         admin.require_auth();
         require_not_paused(&env)?;
-        contests::create_contest(&env, name, start_time, end_time, metric, min_signals, prize_pool)
+        contests::create_contest(
+            &env,
+            name,
+            start_time,
+            end_time,
+            metric,
+            min_signals,
+            prize_pool,
+        )
     }
 
     /// Finalize a contest and distribute prizes
@@ -1242,7 +1258,10 @@ impl SignalRegistry {
     }
 
     /// Get contest leaderboard
-    pub fn get_contest_leaderboard(env: Env, contest_id: u64) -> Result<Vec<ContestEntry>, ContestError> {
+    pub fn get_contest_leaderboard(
+        env: Env,
+        contest_id: u64,
+    ) -> Result<Vec<ContestEntry>, ContestError> {
         contests::get_contest_leaderboard(&env, contest_id)
     }
 
@@ -1266,8 +1285,10 @@ impl SignalRegistry {
     ) -> Result<u32, VersioningError> {
         updater.require_auth();
         let mut signals = Self::get_signals_map(&env);
-        let mut signal = signals.get(signal_id).ok_or(VersioningError::VersionNotFound)?;
-        
+        let mut signal = signals
+            .get(signal_id)
+            .ok_or(VersioningError::VersionNotFound)?;
+
         let new_version = versioning::update_signal(
             &env,
             signal_id,
@@ -1277,10 +1298,10 @@ impl SignalRegistry {
             new_expiry,
             &mut signal,
         )?;
-        
+
         signals.set(signal_id, signal);
         Self::save_signals_map(&env, &signals);
-        
+
         Ok(new_version)
     }
 
@@ -1443,6 +1464,6 @@ mod test_analytics;
 mod test_import;
 mod test_performance;
 mod test_collaboration; */
-mod test_scheduling;
 mod test_contests;
+mod test_scheduling;
 mod test_versioning;

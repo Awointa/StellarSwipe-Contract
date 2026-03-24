@@ -4,6 +4,7 @@ members = [
   "contracts/common",
   "contracts/signal_registry",
   "contracts/auto_trade",
+  "contracts/governance",
   "contracts/oracle",
 ]
 
