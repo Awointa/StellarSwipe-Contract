@@ -1,0 +1,12 @@
+[package]
+name = "bridge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+soroban-sdk = { version = "20.0.0", features = ["alloc", "contract"] }
+soroban-sdk-macros = "20.0.0"
+
+[dev-dependencies]
+soroban-sdk = { version = "20.0.0", features = ["alloc", "contract", "testutils"] }
