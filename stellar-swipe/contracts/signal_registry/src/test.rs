@@ -850,3 +850,153 @@ fn test_follow_multiple_providers_follower_counts() {
     assert_eq!(followed_after.len(), 1);
     assert_eq!(followed_after.get(0).unwrap(), p3);
 }
+
+fn build_vars(env: &Env, entries: &[(&str, &str)]) -> Map<String, String> {
+    let mut vars = Map::new(env);
+    for (k, v) in entries {
+        vars.set(String::from_str(env, k), String::from_str(env, v));
+    }
+    vars
+}
+
+#[test]
+fn test_create_template_with_variables() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let provider = Address::generate(&env);
+    let template_id = client.create_template(
+        &provider,
+        &String::from_str(&env, "Daily BTC Analysis"),
+        &Some(String::from_str(&env, "BTC/USDC")),
+        &String::from_str(
+            &env,
+            "BTC technical analysis for {date}. Entry at {price}, target {target}.",
+        ),
+    );
+
+    let template = client.get_template(&template_id).unwrap();
+    assert_eq!(template.id, template_id);
+    assert_eq!(template.provider, provider);
+    assert_eq!(
+        template.asset_pair,
+        Some(String::from_str(&env, "BTC/USDC"))
+    );
+    assert_eq!(template.use_count, 0);
+}
+
+#[test]
+fn test_submit_signal_from_template_with_variables() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let provider = Address::generate(&env);
+    let template_id = client.create_template(
+        &provider,
+        &String::from_str(&env, "Quick Long"),
+        &Some(String::from_str(&env, "XLM/USDC")),
+        &String::from_str(&env, "Buy setup at {price}, target {target}"),
+    );
+
+    let vars = build_vars(
+        &env,
+        &[("action", "buy"), ("price", "101000"), ("target", "120000")],
+    );
+
+    let signal_id = client.submit_from_template(&provider, &template_id, &vars);
+    let signal = client.get_signal(&signal_id).unwrap();
+    assert_eq!(signal.provider, provider);
+    assert_eq!(signal.asset_pair, String::from_str(&env, "XLM/USDC"));
+    assert_eq!(signal.action, SignalAction::Buy);
+    assert_eq!(signal.price, 101000);
+    assert_eq!(
+        signal.rationale,
+        String::from_str(&env, "Buy setup at 101000, target 120000")
+    );
+
+    let template = client.get_template(&template_id).unwrap();
+    assert_eq!(template.use_count, 1);
+}
+
+#[test]
+fn test_submit_signal_from_template_missing_variables_should_error() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let provider = Address::generate(&env);
+    let template_id = client.create_template(
+        &provider,
+        &String::from_str(&env, "Missing Vars"),
+        &Some(String::from_str(&env, "XLM/USDC")),
+        &String::from_str(&env, "Entry {price}, stop {stop_loss}"),
+    );
+
+    let vars = build_vars(&env, &[("action", "buy"), ("price", "100000")]);
+    let result = client.try_submit_from_template(&provider, &template_id, &vars);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_share_template_and_submit_from_another_provider() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    #[allow(deprecated)]
+    let contract_id = env.register_contract(None, SignalRegistry);
+    let client = SignalRegistryClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let owner = Address::generate(&env);
+    let other_provider = Address::generate(&env);
+
+    let template_id = client.create_template(
+        &owner,
+        &String::from_str(&env, "Shared Template"),
+        &None,
+        &String::from_str(&env, "Momentum on {asset_pair} at {price}"),
+    );
+
+    // Private template cannot be used by another provider
+    let private_vars = build_vars(
+        &env,
+        &[
+            ("asset_pair", "BTC/USDC"),
+            ("action", "sell"),
+            ("price", "90000"),
+        ],
+    );
+    let private_result =
+        client.try_submit_from_template(&other_provider, &template_id, &private_vars);
+    assert!(private_result.is_err());
+
+    // Share publicly and submit successfully from another provider
+    client.set_template_public(&owner, &template_id, &true);
+    let signal_id = client.submit_from_template(&other_provider, &template_id, &private_vars);
+    let signal = client.get_signal(&signal_id).unwrap();
+    assert_eq!(signal.provider, other_provider);
+    assert_eq!(signal.asset_pair, String::from_str(&env, "BTC/USDC"));
+    assert_eq!(signal.action, SignalAction::Sell);
+}

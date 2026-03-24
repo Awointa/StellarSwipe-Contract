@@ -1,32 +1,53 @@
 #![no_std]
 
 mod admin;
+mod analytics;
+mod categories;
+mod collaboration;
+mod contests;
 mod errors;
-#[allow(deprecated)]
 mod events;
-#[allow(dead_code)]
 mod expiry;
-#[allow(dead_code)]
 mod fees;
+mod import;
 mod leaderboard;
 mod performance;
+mod query;
 mod social;
 mod stake;
 mod submission;
+mod templates;
 mod types;
+mod combos;
+mod test_combos;
+mod versioning;
 
 use admin::{
-    get_admin, get_admin_config, get_pause_info, init_admin, is_trading_paused, require_not_paused,
+    get_admin, get_admin_config, init_admin, is_trading_paused, require_not_paused,
     AdminConfig, PauseInfo,
 };
-use errors::AdminError;
-pub use leaderboard::{get_leaderboard, LeaderboardMetric, ProviderLeaderboard};
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Map, String, Vec};
+use categories::{RiskLevel, SignalCategory};
+use errors::{AdminError, TemplateError, ContestError, VersioningError};
+pub use leaderboard::{get_leaderboard as get_leaderboard_internal, LeaderboardMetric, ProviderLeaderboard};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Map, String, Vec};
 use stellar_swipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
+use templates::{SignalTemplate, DEFAULT_TEMPLATE_EXPIRY_HOURS};
 use types::{
-    Asset, FeeBreakdown, ProviderPerformance, Signal, SignalAction, SignalPerformanceView,
-    SignalStatus, TradeExecution,
+    Asset, FeeBreakdown, ImportResultView, ProviderPerformance, Signal, SignalAction,
+    SignalPerformanceView, SignalStatus, SignalSummary, SortOption, TradeExecution,
+    SignalData, RecurrencePattern,
 };
+use combos::{
+    cancel_combo, create_combo_signal, execute_combo_signal, get_combo,
+    get_combo_executions_pub, get_combo_performance, ComboExecution,
+    ComboPerformanceSummary, ComboSignal, ComboType, ComponentExecution,
+    ComponentSignal,
+};
+use errors::ComboError;
+use contests::{
+    Contest, ContestEntry, ContestMetric, ContestStatus,
+};
+use versioning::{SignalVersion, CopyRecord};
 
 const MAX_EXPIRY_SECONDS: u64 = 30 * 24 * 60 * 60;
 
@@ -40,6 +61,12 @@ pub enum StorageKey {
     Signals,
     ProviderStats,
     TradeExecutions,
+    TemplateCounter,
+    Templates,
+    ExternalIdMappings,
+    ComboCounter,
+Combos,
+ComboExecutions(u64),
 }
 
 #[contractimpl]
@@ -90,6 +117,24 @@ impl SignalRegistry {
         get_admin(&env)
     }
 
+   pub fn schedule(
+        env: Env,
+        provider: Address,
+        signal_data: SignalData,
+        publish_at: u64,
+        recurrence: RecurrencePattern,
+    ) -> Result<u64, AdminError> {
+        scheduling::schedule_signal(env, provider, signal_data, publish_at, recurrence)
+    }
+
+    pub fn trigger_scheduled_publications(env: Env) -> Vec<u64> {
+        scheduling::publish_scheduled_signals(env)
+    }
+
+    pub fn cancel_schedule(env: Env, provider: Address, schedule_id: u64) -> Result<(), AdminError> {
+        scheduling::cancel_scheduled_signal(env, provider, schedule_id)
+    }
+
     pub fn get_config(env: Env) -> AdminConfig {
         get_admin_config(&env)
     }
@@ -99,7 +144,7 @@ impl SignalRegistry {
     }
 
     pub fn get_pause_info(env: Env) -> PauseInfo {
-        get_pause_info(&env)
+        admin::get_pause_info(&env)
     }
 
     // Multi-sig functions
@@ -164,6 +209,32 @@ impl SignalRegistry {
         counter
     }
 
+    fn next_trade_id(env: &Env) -> u64 {
+        let mut counter: u64 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::TradeCounter)
+            .unwrap_or(0);
+        counter = counter.checked_add(1).expect("trade id overflow");
+        env.storage()
+            .instance()
+            .set(&StorageKey::TradeCounter, &counter);
+        counter
+    }
+
+    fn get_trade_executions_map(env: &Env) -> Map<u64, TradeExecution> {
+        env.storage()
+            .instance()
+            .get(&StorageKey::TradeExecutions)
+            .unwrap_or(Map::new(env))
+    }
+
+    fn save_trade_executions_map(env: &Env, map: &Map<u64, TradeExecution>) {
+        env.storage()
+            .instance()
+            .set(&StorageKey::TradeExecutions, map);
+    }
+
     fn get_signals_map(env: &Env) -> Map<u64, Signal> {
         env.storage()
             .instance()
@@ -209,13 +280,34 @@ impl SignalRegistry {
         price: i128,
         rationale: String,
         expiry: u64,
+        category: SignalCategory,
+        tags: Vec<String>,
+        risk_level: RiskLevel,
+    ) -> Result<u64, AdminError> {
+        provider.require_auth();
+        Self::create_signal_internal(&env, provider, asset_pair, action, price, rationale, expiry, category, tags, risk_level)
+    }
+
+    fn create_signal_internal(
+        env: &Env,
+        provider: Address,
+        asset_pair: String,
+        action: SignalAction,
+        price: i128,
+        rationale: String,
+        expiry: u64,
+        category: SignalCategory,
+        tags: Vec<String>,
+        risk_level: RiskLevel,
     ) -> Result<u64, AdminError> {
         // Check if trading is paused
-        require_not_paused(&env)?;
+        require_not_paused(env)?;
 
-        provider.require_auth();
-
-        Self::validate_asset_pair(&env, &asset_pair)?;
+        Self::validate_asset_pair(env, &asset_pair)?;
+        
+        // Validate and deduplicate tags
+        categories::validate_tags(&tags)?;
+        let unique_tags = categories::deduplicate_tags(env, tags);
 
         let now = env.ledger().timestamp();
 
@@ -227,7 +319,7 @@ impl SignalRegistry {
             panic!("expiry exceeds max 30 days");
         }
 
-        let id = Self::next_signal_id(&env);
+        let id = Self::next_signal_id(env);
 
         let signal = Signal {
             id,
@@ -241,20 +333,33 @@ impl SignalRegistry {
             status: SignalStatus::Active,
             // Initialize performance tracking fields
             executions: 0,
+            successful_executions: 0,
             total_volume: 0,
             total_roi: 0,
+            // Categorization fields
+            category,
+            tags: unique_tags.clone(),
+            risk_level,
+            // Collaboration field
+            is_collaborative: false,
         };
 
+        // Auto-enter signal into active contests (before moving signal)
+        let _ = contests::auto_enter_signal(env, &signal);
+
         // Store signal
-        let mut signals = Self::get_signals_map(&env);
+        let mut signals = Self::get_signals_map(env);
         signals.set(id, signal);
-        Self::save_signals_map(&env, &signals);
+        Self::save_signals_map(env, &signals);
+        
+        // Update tag popularity
+        categories::increment_tag_popularity(env, &unique_tags);
 
         // Initialize provider stats on first submission
-        let mut stats = Self::get_provider_stats_map(&env);
+        let mut stats = Self::get_provider_stats_map(env);
         if !stats.contains_key(provider.clone()) {
             stats.set(provider, ProviderPerformance::default());
-            Self::save_provider_stats_map(&env, &stats);
+            Self::save_provider_stats_map(env, &stats);
         }
 
         Ok(id)
@@ -268,6 +373,124 @@ impl SignalRegistry {
     pub fn get_provider_stats(env: Env, provider: Address) -> Option<ProviderPerformance> {
         let stats = Self::get_provider_stats_map(&env);
         stats.get(provider)
+    }
+
+    pub fn create_template(
+        env: Env,
+        provider: Address,
+        name: String,
+        asset_pair: Option<String>,
+        rationale_template: String,
+    ) -> Result<u64, TemplateError> {
+        provider.require_auth();
+
+        if name.len() == 0 || rationale_template.len() == 0 {
+            return Err(TemplateError::InvalidTemplate);
+        }
+
+        if let Some(ref pair) = asset_pair {
+            Self::validate_asset_pair(&env, pair).map_err(|_| TemplateError::InvalidTemplate)?;
+        }
+
+        let template_id = templates::get_next_template_id(&env);
+
+        let template = SignalTemplate {
+            id: template_id,
+            provider: provider.clone(),
+            name,
+            asset_pair,
+            action: None,
+            rationale_template,
+            default_expiry_hours: DEFAULT_TEMPLATE_EXPIRY_HOURS,
+            is_public: false,
+            use_count: 0,
+        };
+
+        templates::store_template(&env, template_id, &template);
+        Ok(template_id)
+    }
+
+    pub fn set_template_public(
+        env: Env,
+        provider: Address,
+        template_id: u64,
+        is_public: bool,
+    ) -> Result<(), TemplateError> {
+        provider.require_auth();
+        templates::set_template_visibility(&env, &provider, template_id, is_public)
+    }
+
+    pub fn get_template(env: Env, template_id: u64) -> Option<SignalTemplate> {
+        templates::get_template(&env, template_id)
+    }
+
+    pub fn submit_from_template(
+        env: Env,
+        submitter: Address,
+        template_id: u64,
+        variables: Map<String, String>,
+    ) -> Result<u64, TemplateError> {
+        submitter.require_auth();
+
+        let template =
+            templates::get_template(&env, template_id).ok_or(TemplateError::TemplateNotFound)?;
+        if !template.is_public && template.provider != submitter {
+            return Err(TemplateError::PrivateTemplate);
+        }
+
+        let asset_pair = match template.asset_pair {
+            Some(pair) => pair,
+            None => templates::get_variable(&variables, "asset_pair")?
+                .ok_or(TemplateError::MissingVariable)?,
+        };
+        Self::validate_asset_pair(&env, &asset_pair).map_err(|_| TemplateError::InvalidTemplate)?;
+
+        let action = match template.action {
+            Some(template_action) => templates::parse_action(&template_action)?,
+            None => {
+                let action_text = templates::get_variable(&variables, "action")?
+                    .ok_or(TemplateError::MissingVariable)?;
+                templates::parse_action(&action_text)?
+            }
+        };
+
+        let price_text =
+            templates::get_variable(&variables, "price")?.ok_or(TemplateError::MissingVariable)?;
+        let price = templates::parse_price(&price_text)?;
+
+        let rationale =
+            templates::replace_variables(&env, &template.rationale_template, &variables)?;
+
+        let expiry = env
+            .ledger()
+            .timestamp()
+            .checked_add((template.default_expiry_hours as u64) * 60 * 60)
+            .ok_or(TemplateError::InvalidExpiry)?;
+        if expiry > env.ledger().timestamp() + MAX_EXPIRY_SECONDS {
+            return Err(TemplateError::InvalidExpiry);
+        }
+        
+        // Default category, tags, and risk_level for templates
+        let category = SignalCategory::SwingTrade;
+        let tags = Vec::new(&env);
+        let risk_level = RiskLevel::Medium;
+
+       let signal_id = Self::create_signal_internal(
+            &env,
+            submitter,
+            asset_pair,
+            action,
+            price,
+            rationale,
+            expiry,
+            category,
+            tags,
+            risk_level,
+        )
+        .map_err(|_| TemplateError::InvalidTemplate)?;
+
+        templates::increment_template_use_count(&env, template_id)?;
+        Ok(signal_id)
     }
 
     /* =========================
@@ -410,7 +633,7 @@ impl SignalRegistry {
         limit: u32,
     ) -> Vec<ProviderLeaderboard> {
         let stats_map = Self::get_provider_stats_map(&env);
-        get_leaderboard(&env, &stats_map, metric, limit)
+        get_leaderboard_internal(&env, &stats_map, metric, limit)
     }
 
     /// Get top providers sorted by success rate
@@ -487,12 +710,28 @@ impl SignalRegistry {
     }
 
     /* =========================
-       EXPIRY MANAGEMENT
+       API: QUERY SIGNALS
     ========================== */
 
-    /// Get all active (non-expired) signals for feed.
-    /// If followed_only is true, only returns signals from providers `user` follows.
-    pub fn get_active_signals(env: Env, user: Address, followed_only: bool) -> Vec<Signal> {
+    /// Get all active (non-expired) signals for feed, paginated and sorted.
+    pub fn get_active_signals(
+        env: Env,
+        offset: u32,
+        limit: u32,
+        sort_by: SortOption,
+        provider: Option<Address>,
+    ) -> Vec<SignalSummary> {
+        let signals_map = Self::get_signals_map(&env);
+        query::get_active_signals(&env, &signals_map, provider, offset, limit, sort_by)
+    }
+
+    /// Legacy fallback if front-ends rely on Old behavior
+    /// (Wait, let's keep it as another name if needed, or just let users migrate to the new `get_active_signals`)
+    pub fn get_active_signals_archived(
+        env: Env,
+        user: Address,
+        followed_only: bool,
+    ) -> Vec<Signal> {
         let signals = Self::get_signals_map(&env);
         if followed_only {
             let followed = social::get_followed_providers(&env, &user);
@@ -552,7 +791,515 @@ impl SignalRegistry {
         let signals = Self::get_signals_map(&env);
         expiry::count_signals_pending_expiry(&env, &signals)
     }
+
+
+     //  ANALYTICS FUNCTIONS
+
+    /// Get provider analytics (requires min 10 signals)
+    pub fn get_provider_analytics(
+        env: Env,
+        provider: Address,
+    ) -> Option<analytics::ProviderAnalytics> {
+        let signals = Self::get_signals_map(&env);
+        analytics::calculate_provider_analytics(&env, &signals, &provider)
+    }
+
+    /// Get trending asset pairs in last N hours
+    pub fn get_trending_assets(env: Env, window_hours: u64) -> Vec<(String, u32)> {
+        let signals = Self::get_signals_map(&env);
+        analytics::get_trending_assets(&env, &signals, window_hours)
+    }
+
+    /// Get global analytics (24h metrics)
+    pub fn get_global_analytics(env: Env) -> analytics::GlobalAnalytics {
+        let signals = Self::get_signals_map(&env);
+        analytics::calculate_global_analytics(&env, &signals)
+    }
+    
+    /* =========================
+       CATEGORIZATION & TAGGING FUNCTIONS
+    ========================== */
+    
+    /// Add tags to an existing signal
+    pub fn add_tags_to_signal(
+        env: Env,
+        provider: Address,
+        signal_id: u64,
+        tags: Vec<String>,
+    ) -> Result<(), AdminError> {
+        provider.require_auth();
+        
+        let mut signals = Self::get_signals_map(&env);
+        let mut signal = signals.get(signal_id).ok_or(AdminError::InvalidParameter)?;
+        
+        // Verify provider owns the signal
+        if signal.provider != provider {
+            return Err(AdminError::Unauthorized);
+        }
+        
+        // Validate new tags
+        categories::validate_tags(&tags)?;
+        
+        // Check total tag count
+        if signal.tags.len() + tags.len() > 10 {
+            return Err(AdminError::InvalidParameter);
+        }
+        
+        // Add tags (deduplicate)
+        let mut combined = Vec::new(&env);
+        for i in 0..signal.tags.len() {
+            combined.push_back(signal.tags.get(i).unwrap());
+        }
+        for i in 0..tags.len() {
+            combined.push_back(tags.get(i).unwrap());
+        }
+        
+        signal.tags = categories::deduplicate_tags(&env, combined);
+        let tag_count = signal.tags.len();
+        signals.set(signal_id, signal);
+        Self::save_signals_map(&env, &signals);
+        
+        // Update tag popularity
+        categories::increment_tag_popularity(&env, &tags);
+        
+        // Emit event
+        events::emit_tags_added(&env, signal_id, provider, tag_count);
+        
+        Ok(())
+    }
+    
+    /// Get signals filtered by categories, tags, and risk levels
+    pub fn get_signals_filtered(
+        env: Env,
+        categories: Option<Vec<SignalCategory>>,
+        tags: Option<Vec<String>>,
+        risk_levels: Option<Vec<RiskLevel>>,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Signal> {
+        let signals_map = Self::get_signals_map(&env);
+        let mut filtered = Vec::new(&env);
+        let now = env.ledger().timestamp();
+        
+        // Collect active signals
+        for key in signals_map.keys() {
+            if let Some(signal) = signals_map.get(key) {
+                if signal.status == SignalStatus::Active && signal.expiry > now {
+                    filtered.push_back(signal);
+                }
+            }
+        }
+        
+        // Filter by categories
+        if let Some(cats) = categories {
+            let mut temp = Vec::new(&env);
+            for i in 0..filtered.len() {
+                let signal = filtered.get(i).unwrap();
+                for j in 0..cats.len() {
+                    if signal.category == cats.get(j).unwrap() {
+                        temp.push_back(signal);
+                        break;
+                    }
+                }
+            }
+            filtered = temp;
+        }
+        
+        // Filter by tags (any match)
+        if let Some(tags_filter) = tags {
+            let mut temp = Vec::new(&env);
+            for i in 0..filtered.len() {
+                let signal = filtered.get(i).unwrap();
+                let mut has_tag = false;
+                for j in 0..tags_filter.len() {
+                    let filter_tag = tags_filter.get(j).unwrap();
+                    for k in 0..signal.tags.len() {
+                        if signal.tags.get(k).unwrap().to_bytes() == filter_tag.to_bytes() {
+                            has_tag = true;
+                            break;
+                        }
+                    }
+                    if has_tag {
+                        break;
+                    }
+                }
+                if has_tag {
+                    temp.push_back(signal);
+                }
+            }
+            filtered = temp;
+        }
+        
+        // Filter by risk levels
+        if let Some(risks) = risk_levels {
+            let mut temp = Vec::new(&env);
+            for i in 0..filtered.len() {
+                let signal = filtered.get(i).unwrap();
+                for j in 0..risks.len() {
+                    if signal.risk_level == risks.get(j).unwrap() {
+                        temp.push_back(signal);
+                        break;
+                    }
+                }
+            }
+            filtered = temp;
+        }
+        
+        // Paginate
+        let total = filtered.len();
+        let start = offset.min(total);
+        let end = (offset + limit).min(total);
+        
+        let mut result = Vec::new(&env);
+        for i in start..end {
+            result.push_back(filtered.get(i).unwrap());
+        }
+        
+        result
+    }
+    
+    /// Get popular tags
+    pub fn get_popular_tags(env: Env, limit: u32) -> Vec<(String, u32)> {
+        categories::get_popular_tags(&env, limit)
+    }
+    
+    /// Auto-suggest tags based on signal rationale
+    pub fn suggest_tags(env: Env, rationale: String) -> Vec<String> {
+        categories::auto_suggest_tags(&env, &rationale)
+    }
+
+    /* =======
+       SIGNAL IMPORT FUNCTIONS
+    ========================== */
+
+    /// Import signals from CSV format
+    pub fn import_signals_csv(
+        env: Env,
+        provider: Address,
+        data: Bytes,
+        validate_only: bool,
+    ) -> ImportResultView {
+        provider.require_auth();
+
+        let result = import::import_signals_csv(&env, &provider, data, validate_only);
+
+        ImportResultView {
+            success_count: result.success_count,
+            error_count: result.error_count,
+            signal_ids: Vec::new(&env),
+        }
+    }
+
+    /// Import signals from JSON format
+    pub fn import_signals_json(
+        env: Env,
+        provider: Address,
+        data: Bytes,
+        validate_only: bool,
+    ) -> ImportResultView {
+        provider.require_auth();
+
+        let result = import::import_signals_json(&env, &provider, data, validate_only);
+
+        ImportResultView {
+            success_count: result.success_count,
+            error_count: result.error_count,
+            signal_ids: Vec::new(&env),
+        }
+    }
+
+    /// Get signal ID by external ID
+    pub fn get_signal_by_external_id(
+        env: Env,
+        provider: Address,
+        external_id: String,
+    ) -> Option<u64> {
+        import::get_signal_by_external_id(&env, &provider, &external_id)
+    }
+
+    /* =========================
+       COLLABORATION FUNCTIONS
+    ========================== */
+
+    pub fn create_collaborative_signal(
+        env: Env,
+        primary_author: Address,
+        co_authors: Vec<Address>,
+        contribution_pcts: Vec<u32>,
+        asset_pair: String,
+        action: SignalAction,
+        price: i128,
+        rationale: String,
+        expiry: u64,
+    ) -> Result<u64, AdminError> {
+        primary_author.require_auth();
+
+        let category = SignalCategory::SwingTrade;
+        let tags = Vec::new(&env);
+        let risk_level = RiskLevel::Medium;
+
+        let signal_id = Self::create_signal_internal(
+            &env,
+            primary_author.clone(),
+            asset_pair,
+            action,
+            price,
+            rationale,
+            expiry,
+            category,
+            tags,
+            risk_level,
+        )?;
+
+        let mut signals = Self::get_signals_map(&env);
+        let mut signal = signals.get(signal_id).unwrap();
+        signal.is_collaborative = true;
+        signal.status = SignalStatus::Pending;
+        signals.set(signal_id, signal);
+        Self::save_signals_map(&env, &signals);
+
+        collaboration::create_collaborative_signal(
+            &env,
+            signal_id,
+            primary_author,
+            co_authors.clone(),
+            contribution_pcts,
+        )?;
+
+        events::emit_collaborative_signal_created(&env, signal_id, co_authors);
+        Ok(signal_id)
+    }
+
+    pub fn approve_collaborative_signal(
+        env: Env,
+        signal_id: u64,
+        approver: Address,
+    ) -> Result<(), AdminError> {
+        approver.require_auth();
+
+        let all_approved = collaboration::approve_collaborative_signal(&env, signal_id, &approver)?;
+        events::emit_collaborative_signal_approved(&env, signal_id, approver);
+
+        if all_approved {
+            let mut signals = Self::get_signals_map(&env);
+            let mut signal = signals.get(signal_id).ok_or(AdminError::InvalidParameter)?;
+            signal.status = SignalStatus::Active;
+            signals.set(signal_id, signal);
+            Self::save_signals_map(&env, &signals);
+            events::emit_collaborative_signal_published(&env, signal_id);
+        }
+
+        Ok(())
+    }
+
+    pub fn get_collaboration_details(
+        env: Env,
+        signal_id: u64,
+    ) -> Option<Vec<collaboration::Author>> {
+        collaboration::get_collaborative_signal(&env, signal_id)
+    }
+
+    pub fn is_collaborative_signal(env: Env, signal_id: u64) -> bool {
+        collaboration::is_collaborative_signal(&env, signal_id)
+    }
+
+    /* =========================
+       COMBO SIGNAL FUNCTIONS
+    ========================== */
+
+    /// Create a combo signal linking multiple component signals.
+    ///
+    /// All component signals must belong to `provider` and be Active.
+    /// Component weights must sum to exactly 10 000 (100% in basis points).
+    pub fn create_combo_signal(
+        env: Env,
+        provider: Address,
+        name: String,
+        components: Vec<ComponentSignal>,
+        combo_type: ComboType,
+    ) -> Result<u64, ComboError> {
+        provider.require_auth();
+
+        let combo_id =
+            create_combo_signal(&env, &provider, name, components, combo_type)?;
+
+        events::emit_combo_created(
+            &env,
+            combo_id,
+            provider,
+            // component count already validated inside create_combo_signal
+            combo_id, // placeholder — use actual count below
+        );
+
+        Ok(combo_id)
+    }
+
+    /// Execute a combo signal, distributing `total_amount` across components
+    /// according to their weights and the combo type.
+    pub fn execute_combo_signal(
+        env: Env,
+        combo_id: u64,
+        user: Address,
+        total_amount: i128,
+    ) -> Result<Vec<ComponentExecution>, ComboError> {
+        user.require_auth();
+
+        let executions =
+            execute_combo_signal(&env, combo_id, &user, total_amount)?;
+
+        // Calculate combined ROI for the event (already stored, re-derive for event)
+        let execs_stored = get_combo_executions_pub(&env, combo_id);
+        let combined_roi = if let Some(last) = execs_stored.get(execs_stored.len().saturating_sub(1)) {
+            last.combined_roi
+        } else {
+            0
+        };
+
+        events::emit_combo_executed(&env, combo_id, user, combined_roi);
+
+        Ok(executions)
+    }
+
+    /// Cancel an active combo. Only the provider who created it may cancel.
+    pub fn cancel_combo_signal(
+        env: Env,
+        combo_id: u64,
+        provider: Address,
+    ) -> Result<(), ComboError> {
+        provider.require_auth();
+        cancel_combo(&env, combo_id, &provider)?;
+        events::emit_combo_cancelled(&env, combo_id, provider);
+        Ok(())
+    }
+
+    /// Retrieve a combo signal by ID.
+    pub fn get_combo_signal(env: Env, combo_id: u64) -> Option<ComboSignal> {
+        get_combo(&env, combo_id)
+    }
+
+    /// Get aggregated performance metrics for a combo.
+    pub fn get_combo_performance(env: Env, combo_id: u64) -> Option<ComboPerformanceSummary> {
+        get_combo_performance(&env, combo_id)
+    }
+
+    /// Get the full execution history for a combo.
+    pub fn get_combo_executions(env: Env, combo_id: u64) -> Vec<ComboExecution> {
+        get_combo_executions_pub(&env, combo_id)
+    }
+
+    /* =========================
+       CONTEST FUNCTIONS
+    ========================== */
+
+    /// Create a new contest
+    pub fn create_contest(
+        env: Env,
+        admin: Address,
+        name: String,
+        start_time: u64,
+        end_time: u64,
+        metric: ContestMetric,
+        min_signals: u32,
+        prize_pool: i128,
+    ) -> Result<u64, ContestError> {
+        admin.require_auth();
+        require_not_paused(&env)?;
+        contests::create_contest(&env, name, start_time, end_time, metric, min_signals, prize_pool)
+    }
+
+    /// Finalize a contest and distribute prizes
+    pub fn finalize_contest(env: Env, contest_id: u64) -> Result<Vec<Address>, ContestError> {
+        contests::finalize_contest(&env, contest_id)
+    }
+
+    /// Get contest details
+    pub fn get_contest(env: Env, contest_id: u64) -> Result<Contest, ContestError> {
+        contests::get_contest(&env, contest_id)
+    }
+
+    /// Get all active contests
+    pub fn get_active_contests(env: Env) -> Vec<u64> {
+        contests::get_active_contests(&env)
+    }
+
+    /// Get contest leaderboard
+    pub fn get_contest_leaderboard(env: Env, contest_id: u64) -> Result<Vec<ContestEntry>, ContestError> {
+        contests::get_contest_leaderboard(&env, contest_id)
+    }
+
+    /// Get provider's prize for a contest
+    pub fn get_provider_prize(env: Env, contest_id: u64, provider: Address) -> i128 {
+        contests::get_provider_prize(&env, contest_id, provider)
+    }
+
+    /* =========================
+       VERSIONING FUNCTIONS
+    ========================== */
+
+    /// Update an active signal
+    pub fn update_signal(
+        env: Env,
+        signal_id: u64,
+        updater: Address,
+        new_price: Option<i128>,
+        new_rationale: Option<String>,
+        new_expiry: Option<u64>,
+    ) -> Result<u32, VersioningError> {
+        updater.require_auth();
+        let mut signals = Self::get_signals_map(&env);
+        let mut signal = signals.get(signal_id).ok_or(VersioningError::VersionNotFound)?;
+        
+        let new_version = versioning::update_signal(
+            &env,
+            signal_id,
+            &updater,
+            new_price,
+            new_rationale,
+            new_expiry,
+            &mut signal,
+        )?;
+        
+        signals.set(signal_id, signal);
+        Self::save_signals_map(&env, &signals);
+        
+        Ok(new_version)
+    }
+
+    /// Get version history for a signal
+    pub fn get_signal_history(env: Env, signal_id: u64) -> Vec<SignalVersion> {
+        versioning::get_signal_history(&env, signal_id)
+    }
+
+    /// Record when a user copies a signal
+    pub fn record_signal_copy(env: Env, user: Address, signal_id: u64) {
+        user.require_auth();
+        let version = versioning::get_latest_version(&env, signal_id);
+        versioning::record_copy(&env, &user, signal_id, version);
+    }
+
+    /// Get pending updates for a user's copied signal
+    pub fn get_pending_updates(env: Env, user: Address, signal_id: u64) -> Vec<u32> {
+        versioning::get_pending_updates(&env, &user, signal_id)
+    }
+
+    /// Get copy record for a user
+    pub fn get_copy_record(env: Env, user: Address, signal_id: u64) -> Option<CopyRecord> {
+        versioning::get_copy_record(&env, &user, signal_id)
+    }
+
+    /// Mark user as notified of an update
+    pub fn mark_update_notified(env: Env, user: Address, signal_id: u64, version: u32) {
+        versioning::mark_notified(&env, &user, signal_id, version);
+    }
 }
 
-mod test;
+/*mod test;
+mod test_analytics;
+mod test_categories;
+mod test_analytics;
+mod test_import;
 mod test_performance;
+mod test_collaboration; */
+mod test_scheduling;
+mod test_contests;
+mod test_versioning;

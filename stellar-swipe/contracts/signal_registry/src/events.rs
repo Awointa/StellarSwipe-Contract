@@ -102,3 +102,53 @@ pub fn emit_follow_lost(env: &Env, user: Address, provider: Address, new_count: 
     let topics = (Symbol::new(env, "follow_lost"), provider, user);
     env.events().publish(topics, new_count);
 }
+
+pub fn emit_tags_added(env: &Env, signal_id: u64, provider: Address, tag_count: u32) {
+    let topics = (Symbol::new(env, "tags_added"), signal_id, provider);
+    env.events().publish(topics, tag_count);
+}
+
+pub fn emit_collaborative_signal_created(env: &Env, signal_id: u64, authors: Vec<Address>) {
+    let topics = (Symbol::new(env, "collab_signal_created"), signal_id);
+    env.events().publish(topics, authors);
+}
+
+pub fn emit_collaborative_signal_approved(env: &Env, signal_id: u64, approver: Address) {
+    let topics = (Symbol::new(env, "collab_signal_approved"), signal_id, approver);
+    env.events().publish(topics, ());
+}
+
+pub fn emit_collaborative_signal_published(env: &Env, signal_id: u64) {
+    let topics = (Symbol::new(env, "collab_signal_published"), signal_id);
+    env.events().publish(topics, ());
+}
+
+pub fn emit_data_exported(env: &Env, requester: Address, entity_type: u32, record_count: u32) {
+    let topics = (Symbol::new(env, "data_exported"), requester);
+    env.events().publish(topics, (entity_type, record_count));
+}
+
+pub fn emit_combo_created(env: &Env, combo_id: u64, provider: Address, component_count: u32) {
+    let topics = (Symbol::new(env, "combo_created"), combo_id, provider);
+    env.events().publish(topics, component_count);
+}
+
+pub fn emit_combo_executed(env: &Env, combo_id: u64, executor: Address, combined_roi: i128) {
+    let topics = (Symbol::new(env, "combo_executed"), combo_id, executor);
+    env.events().publish(topics, combined_roi);
+}
+
+pub fn emit_combo_cancelled(env: &Env, combo_id: u64, provider: Address) {
+    let topics = (Symbol::new(env, "combo_cancelled"), combo_id, provider);
+    env.events().publish(topics, ());
+}
+
+pub fn emit_signal_updated(env: &Env, signal_id: u64, version: u32, updater: Address) {
+    let topics = (Symbol::new(env, "signal_updated"), signal_id, updater);
+    env.events().publish(topics, version);
+}
+
+pub fn emit_copy_recorded(env: &Env, user: Address, signal_id: u64, version: u32) {
+    let topics = (Symbol::new(env, "copy_recorded"), signal_id, user);
+    env.events().publish(topics, version);
+}

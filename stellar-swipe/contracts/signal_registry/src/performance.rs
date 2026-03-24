@@ -56,6 +56,14 @@ pub fn update_signal_stats(signal: &mut Signal, trade: &TradeExecution) {
         .checked_add(1)
         .expect("executions overflow");
 
+    // Increment successful validations if ROI > 0
+    if trade.roi > 0 {
+        signal.successful_executions = signal
+            .successful_executions
+            .checked_add(1)
+            .expect("successful executions overflow");
+    }
+
     // Add trade volume
     signal.total_volume = signal
         .total_volume
@@ -246,6 +254,11 @@ mod tests {
             executions: 0,
             total_volume: 0,
             total_roi: 0,
+            category: crate::categories::SignalCategory::SwingTrade,
+            risk_level: crate::categories::RiskLevel::Medium,
+            is_collaborative: false,
+            tags: soroban_sdk::vec![&soroban_sdk::Env::default()],
+            successful_executions: 0,
         };
 
         let status = evaluate_signal_status(&signal, 2001);
@@ -267,6 +280,11 @@ mod tests {
             executions: 0,
             total_volume: 0,
             total_roi: 0,
+            category: crate::categories::SignalCategory::SwingTrade,
+            risk_level: crate::categories::RiskLevel::Medium,
+            is_collaborative: false,
+            tags: soroban_sdk::vec![&soroban_sdk::Env::default()],
+            successful_executions: 0,
         };
 
         assert_eq!(get_signal_average_roi(&signal), 0);
