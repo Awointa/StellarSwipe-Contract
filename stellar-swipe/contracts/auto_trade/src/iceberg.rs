@@ -551,7 +551,7 @@ fn place_sdex_limit_order(
 ) -> Result<u64, String> {
     // Placeholder - would integrate with actual SDEX
     // Returns mock SDEX order ID
-    let sdex_order_id = (env.ledger().timestamp() + amount + price) as u64;
+    let sdex_order_id = (env.ledger().timestamp() as i128 + amount + price) as u64;
     Ok(sdex_order_id)
 }
 

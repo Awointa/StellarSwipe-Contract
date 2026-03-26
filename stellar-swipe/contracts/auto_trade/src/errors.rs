@@ -35,4 +35,19 @@ pub enum AutoTradeError {
     PairNotCointegrated = 26,
     InvalidPairsConfig = 27,
  
+    // Arbitrage
+    ArbitrageOpportunityExpired = 28,
+    ArbitrageUnprofitable = 29,
+    ArbTooLarge = 30,
+    FrontRunningRisk = 31,
+
+    // Insurance
+    InvalidInsuranceConfig = 32,
+    InsuranceNotConfigured = 33,
+
+    // Referral
+    SelfReferral = 34,
+    ReferralAlreadySet = 35,
+    CircularReferral = 36,
+    ReferralLimitExceeded = 37,
 }

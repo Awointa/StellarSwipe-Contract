@@ -1086,7 +1086,7 @@ fn test_multiple_authorization_grants_latest_applies() {
         assert_eq!(config.max_trade_amount, 1000_0000000);
         assert_eq!(config.expires_at, 1000 + (60 * 86400));
     });
-
+}
 
 #[test]
 fn test_authorization_at_exact_limit() {
