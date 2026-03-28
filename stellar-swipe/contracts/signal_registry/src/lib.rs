@@ -24,26 +24,27 @@ mod submission;
 mod templates;
 mod types;
 mod cross_chain;
-mod test_combos;
 mod versioning;
 
 use admin::{
-    get_admin, get_admin_config, init_admin, is_trading_paused, require_not_paused, AdminConfig,
+    get_admin, get_admin_config, init_admin, is_trading_paused, require_not_paused_legacy as require_not_paused,
+    AdminConfig,
 };
-use stellar_swipe_common::emergency::{PauseState, CAT_SIGNALS, CAT_TRADING, CAT_STAKES, CAT_ALL};
+use stellar_swipe_common::emergency::{PauseState, CAT_ALL, CAT_SIGNALS, CAT_STAKES, CAT_TRADING};
 use categories::{RiskLevel, SignalCategory};
-use errors::{AdminError, TemplateError, ContestError, VersioningError, CrossChainError};
-pub use leaderboard::{get_leaderboard as get_leaderboard_internal, LeaderboardMetric, ProviderLeaderboard};
 use combos::{
     cancel_combo, create_combo_signal, execute_combo_signal, get_combo, get_combo_executions_pub,
     get_combo_performance, ComboExecution, ComboPerformanceSummary, ComboSignal, ComboType,
     ComponentExecution, ComponentSignal,
 };
 use contests::{Contest, ContestEntry, ContestMetric, ContestStatus};
-use errors::ComboError;
-pub use ml_scoring::{
-    MLModel, SignalFeatures, SignalScore,
+use errors::{
+    AdminError, ComboError, ContestError, CrossChainError, TemplateError, VersioningError,
 };
+pub use leaderboard::{
+    get_leaderboard as get_leaderboard_internal, LeaderboardMetric, ProviderLeaderboard,
+};
+pub use ml_scoring::{MLModel, SignalFeatures, SignalScore};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Map, String, Vec};
 use stellar_swipe_common::{validate_asset_pair as validate_asset_pair_common, AssetPairError};
 use templates::{SignalTemplate, DEFAULT_TEMPLATE_EXPIRY_HOURS};
@@ -155,6 +156,18 @@ impl SignalRegistry {
 
     pub fn transfer_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), AdminError> {
         admin::transfer_admin(&env, &caller, new_admin)
+    }
+
+    pub fn set_guardian(env: Env, caller: Address, guardian: Address) -> Result<(), AdminError> {
+        admin::set_guardian(&env, &caller, guardian)
+    }
+
+    pub fn revoke_guardian(env: Env, caller: Address) -> Result<(), AdminError> {
+        admin::revoke_guardian(&env, &caller)
+    }
+
+    pub fn get_guardian(env: Env) -> Option<Address> {
+        admin::get_guardian(&env)
     }
 
     pub fn get_admin(env: Env) -> Result<Address, AdminError> {
@@ -1223,7 +1236,7 @@ impl SignalRegistry {
     ) -> Result<u64, ComboError> {
         provider.require_auth();
 
-        let count = components.len() as u32;
+        let count = components.len();
         let combo_id = create_combo_signal(&env, &provider, name, components, combo_type)?;
 
         events::emit_combo_created(&env, combo_id, provider, count);
@@ -1300,7 +1313,8 @@ impl SignalRegistry {
         prize_pool: i128,
     ) -> Result<u64, ContestError> {
         admin.require_auth();
-        require_not_paused(&env, String::from_str(&env, CAT_TRADING)).map_err(|e| match e {
+
+        require_not_paused(&env).map_err(|e| match e {
             AdminError::TradingPaused => ContestError::TradingPaused,
             AdminError::CircuitBreakerTriggered => ContestError::CircuitBreakerTriggered,
             _ => ContestError::ContestNotFound,
@@ -1698,15 +1712,14 @@ impl SignalRegistry {
     }
 }
 
-/*mod test;
-mod test_analytics;
-mod test_categories;
-mod test_analytics;
-mod test_import;
-mod test_performance;
-mod test_collaboration; */
+#[cfg(test)]
+mod test_combos;
+#[cfg(test)]
 mod test_contests;
+#[cfg(test)]
 mod test_scheduling;
+#[cfg(test)]
 mod test_versioning;
+#[cfg(test)]
 mod test_emergency;
 mod test_health;
