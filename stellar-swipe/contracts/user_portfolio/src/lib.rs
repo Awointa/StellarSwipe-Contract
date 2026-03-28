@@ -1,12 +1,9 @@
-//! User portfolio contract: positions, `get_pnl`, and on-chain badges.
+//! User portfolio contract: positions and `get_pnl` (source of truth for portfolio performance).
 
 #![cfg_attr(target_family = "wasm", no_std)]
 
-mod badges;
 mod queries;
 mod storage;
-
-pub use badges::{Badge, BadgeType};
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 use storage::DataKey;
@@ -38,19 +35,6 @@ pub struct Position {
     pub status: PositionStatus,
     /// Set when `status == Closed`; ignored while open.
     pub realized_pnl: i128,
-    /// Ledger close time when `status == Closed`; `0` while open.
-    pub closed_at: u64,
-}
-
-/// One closed leg in `get_trade_history` (newest-first pages).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TradeHistoryEntry {
-    pub trade_id: u64,
-    pub entry_price: i128,
-    pub amount: i128,
-    pub realized_pnl: i128,
-    pub closed_at: u64,
 }
 
 #[contract]
@@ -58,13 +42,8 @@ pub struct UserPortfolio;
 
 #[contractimpl]
 impl UserPortfolio {
-    /// One-time setup: admin, oracle (`get_price() -> i128`), and max users who receive `EarlyAdopter`.
-    pub fn initialize(
-        env: Env,
-        admin: Address,
-        oracle: Address,
-        early_adopter_user_cap: u32,
-    ) {
+    /// One-time setup: admin and oracle (`get_price() -> i128`) used for unrealized P&L.
+    pub fn initialize(env: Env, admin: Address, oracle: Address) {
         if env.storage().instance().has(&DataKey::Initialized) {
             panic!("already initialized");
         }
@@ -73,25 +52,11 @@ impl UserPortfolio {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Oracle, &oracle);
         env.storage().instance().set(&DataKey::NextPositionId, &1u64);
-        env.storage()
-            .instance()
-            .set(&DataKey::EarlyAdopterCap, &early_adopter_user_cap);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalUsersFirstOpen, &0u32);
     }
 
     pub fn set_oracle(env: Env, oracle: Address) {
         Self::require_admin(&env);
         env.storage().instance().set(&DataKey::Oracle, &oracle);
-    }
-
-    /// Backend / admin sets current leaderboard rank (1 = best). Checked on open/close for `Top10Leaderboard`.
-    pub fn set_leaderboard_rank(env: Env, user: Address, rank: u32) {
-        Self::require_admin(&env);
-        env.storage()
-            .persistent()
-            .set(&DataKey::LeaderboardRank(user), &rank);
     }
 
     /// Opens a position for `user` (caller must be `user`). `amount` is invested notional at entry.
@@ -113,7 +78,6 @@ impl UserPortfolio {
             amount,
             status: PositionStatus::Open,
             realized_pnl: 0,
-            closed_at: 0,
         };
         env.storage().persistent().set(&DataKey::Position(id), &pos);
 
@@ -123,11 +87,8 @@ impl UserPortfolio {
             .persistent()
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
-        let is_first_ever_open = list.is_empty();
         list.push_back(id);
         env.storage().persistent().set(&key, &list);
-
-        badges::after_open_position(&env, &user, is_first_ever_open);
 
         id
     }
@@ -165,39 +126,12 @@ impl UserPortfolio {
         }
         pos.status = PositionStatus::Closed;
         pos.realized_pnl = realized_pnl;
-        pos.closed_at = env.ledger().timestamp();
         env.storage().persistent().set(&pkey, &pos);
-
-        let chrono_key = DataKey::UserClosedChronological(user.clone());
-        let mut closed_order: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&chrono_key)
-            .unwrap_or_else(|| Vec::new(&env));
-        closed_order.push_back(position_id);
-        env.storage().persistent().set(&chrono_key, &closed_order);
-
-        badges::after_close_position(&env, &user, realized_pnl);
-    }
-
-    /// All badges earned by `user`, in award order.
-    pub fn get_badges(env: Env, user: Address) -> Vec<Badge> {
-        badges::get_badges(&env, user)
     }
 
     /// Portfolio P&L including open positions when oracle price is available.
     pub fn get_pnl(env: Env, user: Address) -> PnlSummary {
         queries::compute_get_pnl(&env, user)
-    }
-
-    /// Paginated closed trades, newest first. `cursor` is `trade_id` of the last item from the prior page; `limit` at most 50.
-    pub fn get_trade_history(
-        env: Env,
-        user: Address,
-        cursor: Option<u64>,
-        limit: u32,
-    ) -> Vec<TradeHistoryEntry> {
-        queries::get_trade_history(&env, user, cursor, limit)
     }
 
     fn require_admin(env: &Env) {
@@ -255,8 +189,7 @@ mod tests {
         env: &Env,
         use_working_oracle: bool,
         initial_price: i128,
-        early_adopter_cap: u32,
-    ) -> (Address, Address, Address, Address) {
+    ) -> (Address, Address, Address) {
         let admin = Address::generate(env);
         let user = Address::generate(env);
         let oracle_id = if use_working_oracle {
@@ -269,15 +202,15 @@ mod tests {
         let contract_id = env.register_contract(None, UserPortfolio);
         let client = UserPortfolioClient::new(env, &contract_id);
         env.mock_all_auths();
-        client.initialize(&admin, &oracle_id, &early_adopter_cap);
-        (admin, user, contract_id, oracle_id)
+        client.initialize(&admin, &oracle_id);
+        (user, contract_id, oracle_id)
     }
 
     /// All positions closed: unrealized is 0, total = realized, ROI uses invested sums.
     #[test]
     fn get_pnl_all_closed() {
         let env = Env::default();
-        let (_, user, portfolio_id, _) = setup_portfolio(&env, true, 100, 1000);
+        let (user, portfolio_id, _) = setup_portfolio(&env, true, 100);
         let client = UserPortfolioClient::new(&env, &portfolio_id);
 
         client.open_position(&user, &100, &1_000);
@@ -297,7 +230,7 @@ mod tests {
     #[test]
     fn get_pnl_all_open() {
         let env = Env::default();
-        let (_, user, portfolio_id, oracle_id) = setup_portfolio(&env, true, 100, 1000);
+        let (user, portfolio_id, oracle_id) = setup_portfolio(&env, true, 100);
         let client = UserPortfolioClient::new(&env, &portfolio_id);
 
         // entry 100, amount 1000, current 120 -> (120-100)*1000/100 = 200
@@ -315,7 +248,7 @@ mod tests {
     #[test]
     fn get_pnl_mixed() {
         let env = Env::default();
-        let (_, user, portfolio_id, oracle_id) = setup_portfolio(&env, true, 50, 1000);
+        let (user, portfolio_id, oracle_id) = setup_portfolio(&env, true, 50);
         let client = UserPortfolioClient::new(&env, &portfolio_id);
 
         client.open_position(&user, &50, &2_000);
@@ -336,7 +269,7 @@ mod tests {
     #[test]
     fn get_pnl_oracle_unavailable() {
         let env = Env::default();
-        let (_, user, portfolio_id, _) = setup_portfolio(&env, false, 0, 1000);
+        let (user, portfolio_id, _) = setup_portfolio(&env, false, 0);
         let client = UserPortfolioClient::new(&env, &portfolio_id);
 
         client.open_position(&user, &100, &1_000);
@@ -350,59 +283,4 @@ mod tests {
         // invested: 1000 closed + 500 open = 1500
         assert_eq!(pnl.roi_bps, 333);
     }
-
-    /// 100 closes, pages of 20: full coverage in reverse chronological order.
-    #[test]
-    fn get_trade_history_paginate_100_by_20() {
-        let env = Env::default();
-        let (_, user, portfolio_id, _) = setup_portfolio(&env, true, 100, 1000);
-        let client = UserPortfolioClient::new(&env, &portfolio_id);
-
-        for i in 0..100 {
-            let id = client.open_position(&user, &100, &(i as i128 + 1));
-            client.close_position(&user, &id, &(i as i128));
-        }
-
-        let mut cursor = Option::<u64>::None;
-        let mut flat: Vec<u64> = Vec::new(&env);
-        loop {
-            let page = client.get_trade_history(&user, &cursor, &20);
-            if page.is_empty() {
-                break;
-            }
-            for j in 0..page.len() {
-                if let Some(e) = page.get(j) {
-                    flat.push_back(e.trade_id);
-                }
-            }
-            if page.len() < 20 {
-                break;
-            }
-            let last_idx = page.len() - 1;
-            let last = page.get(last_idx).expect("last entry");
-            cursor = Some(last.trade_id);
-        }
-
-        assert_eq!(flat.len(), 100);
-        for i in 0u32..100 {
-            let expected = 100_u64 - i as u64;
-            assert_eq!(flat.get(i), Some(expected));
-        }
-    }
-
-    #[test]
-    fn get_trade_history_limit_capped_at_50() {
-        let env = Env::default();
-        let (_, user, portfolio_id, _) = setup_portfolio(&env, true, 100, 1000);
-        let client = UserPortfolioClient::new(&env, &portfolio_id);
-        for i in 0..60 {
-            let id = client.open_position(&user, &100, &(100 + i as i128));
-            client.close_position(&user, &id, &0);
-        }
-        let page = client.get_trade_history(&user, &Option::None, &200);
-        assert_eq!(page.len(), 50);
-    }
 }
-
-#[cfg(test)]
-mod badge_tests;
