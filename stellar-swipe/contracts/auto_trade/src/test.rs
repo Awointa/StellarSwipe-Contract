@@ -1808,7 +1808,6 @@ main
             // Due after 1 hour
             env.ledger().set_timestamp(1_000 + 3_600);
             assert!(is_purchase_due(&env, id).unwrap());
-=======
     fn test_invalid_config_rejected() {
         let env = setup_env();
         let contract_id = env.register(AutoTradeContract, ());
