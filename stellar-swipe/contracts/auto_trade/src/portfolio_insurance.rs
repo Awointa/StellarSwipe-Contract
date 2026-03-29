@@ -16,7 +16,7 @@ use crate::risk;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HedgePurpose {
     PortfolioProtection,
-    AssetSpecificHedge { hedged_asset: u32 },
+    AssetSpecificHedge(u32),
 }
 
 /// A single open hedge position.
@@ -337,9 +337,7 @@ fn calculate_optimal_hedges(
                 asset: asset_id,
                 amount,
                 entry_price: price,
-                purpose: HedgePurpose::AssetSpecificHedge {
-                    hedged_asset: asset_id,
-                },
+                purpose: HedgePurpose::AssetSpecificHedge(asset_id),
             });
         }
     }

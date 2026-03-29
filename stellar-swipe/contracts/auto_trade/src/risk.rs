@@ -13,6 +13,8 @@ pub struct RiskConfig {
     pub max_position_pct: u32,  // Percentage (0-100)
     pub daily_trade_limit: u32, // Max trades per 24 hours
     pub stop_loss_pct: u32,     // Percentage (0-100)
+    pub trailing_stop_enabled: bool,
+    pub trailing_stop_pct: u32, // Basis points, e.g. 1000 = 10%
 }
 
 impl Default for RiskConfig {
@@ -21,6 +23,8 @@ impl Default for RiskConfig {
             max_position_pct: 20,  // 20% of portfolio
             daily_trade_limit: 10, // 10 trades per day
             stop_loss_pct: 15,     // 15% stop loss
+            trailing_stop_enabled: false,
+            trailing_stop_pct: 1000,
         }
     }
 }
@@ -51,6 +55,7 @@ pub struct Position {
     pub asset_id: u32,
     pub amount: i128,
     pub entry_price: i128,
+    pub high_price: i128,
     pub timestamp: u64,
 }
 
@@ -190,11 +195,35 @@ pub fn update_position(env: &Env, user: &Address, asset_id: u32, amount: i128, p
     if amount == 0 {
         positions.remove(asset_id);
     } else {
-        let position = Position {
-            asset_id,
-            amount,
-            entry_price: price,
-            timestamp: env.ledger().timestamp(),
+        let position = if let Some(existing) = positions.get(asset_id) {
+            let is_reduction = amount < existing.amount;
+            Position {
+                asset_id,
+                amount,
+                entry_price: if is_reduction {
+                    existing.entry_price
+                } else {
+                    price
+                },
+                high_price: if existing.high_price > price {
+                    existing.high_price
+                } else {
+                    price
+                },
+                timestamp: if is_reduction {
+                    existing.timestamp
+                } else {
+                    env.ledger().timestamp()
+                },
+            }
+        } else {
+            Position {
+                asset_id,
+                amount,
+                entry_price: price,
+                high_price: price,
+                timestamp: env.ledger().timestamp(),
+            }
         };
         positions.set(asset_id, position);
     }
@@ -330,20 +359,25 @@ pub fn check_position_limit(
     Ok(())
 }
 
-/// Check if stop-loss is triggered for a sell
+/// Check if stop-loss is triggered for a sell, preferring oracle price over SDEX spot.
+///
+/// `oracle_price` — when `Some`, this manipulation-resistant price is used;
+/// when `None`, `current_price` (SDEX spot) is used as a fallback.
 pub fn check_stop_loss(
     env: &Env,
     user: &Address,
     asset_id: u32,
     current_price: i128,
+    oracle_price: Option<i128>,
     config: &RiskConfig,
 ) -> bool {
     let positions = get_user_positions(env, user);
 
     if let Some(position) = positions.get(asset_id) {
+        let reference_price = oracle_price.unwrap_or(current_price);
         let stop_loss_price = position.entry_price * (100 - config.stop_loss_pct as i128) / 100;
 
-        if current_price <= stop_loss_price {
+        if reference_price <= stop_loss_price {
             return true;
         }
     }
@@ -351,7 +385,10 @@ pub fn check_stop_loss(
     false
 }
 
-/// Perform all risk checks before executing a trade
+/// Perform all risk checks before executing a trade.
+///
+/// `oracle_price` — when `Some`, used for stop-loss evaluation instead of
+/// the SDEX spot `price`, providing manipulation resistance.
 pub fn validate_trade(
     env: &Env,
     user: &Address,
@@ -359,6 +396,7 @@ pub fn validate_trade(
     amount: i128,
     price: i128,
     is_sell: bool,
+    oracle_price: Option<i128>,
 ) -> Result<bool, AutoTradeError> {
     let config = get_risk_config(env, user);
 
@@ -370,9 +408,9 @@ pub fn validate_trade(
         check_position_limit(env, user, asset_id, amount, price, &config)?;
     }
 
-    // Check stop-loss (only for sells)
+    // Check stop-loss (only for sells), using oracle price when available
     let stop_loss_triggered = if is_sell {
-        check_stop_loss(env, user, asset_id, price, &config)
+        check_stop_loss(env, user, asset_id, price, oracle_price, &config)
     } else {
         false
     };
@@ -410,6 +448,8 @@ mod tests {
             assert_eq!(config.max_position_pct, 20);
             assert_eq!(config.daily_trade_limit, 10);
             assert_eq!(config.stop_loss_pct, 15);
+            assert!(!config.trailing_stop_enabled);
+            assert_eq!(config.trailing_stop_pct, 1000);
         });
     }
 
@@ -424,6 +464,8 @@ mod tests {
                 max_position_pct: 30,
                 daily_trade_limit: 15,
                 stop_loss_pct: 10,
+                trailing_stop_enabled: true,
+                trailing_stop_pct: 1500,
             };
             set_risk_config(&env, &user, &custom_config);
 
@@ -524,7 +566,7 @@ mod tests {
             // Entry price 100, stop loss at 15% = 85
             update_position(&env, &user, 1, 1000, 100);
 
-            let triggered = check_stop_loss(&env, &user, 1, 90, &config);
+            let triggered = check_stop_loss(&env, &user, 1, 90, None, &config);
             assert!(!triggered);
         });
     }
@@ -541,7 +583,7 @@ mod tests {
             // Entry price 100, stop loss at 15% = 85
             update_position(&env, &user, 1, 1000, 100);
 
-            let triggered = check_stop_loss(&env, &user, 1, 80, &config);
+            let triggered = check_stop_loss(&env, &user, 1, 80, None, &config);
             assert!(triggered);
         });
     }

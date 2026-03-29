@@ -115,7 +115,7 @@ pub fn calculate_trust_score(
 
     // Calculate individual components
     let success_rate_component = calculate_success_rate_component(performance);
-    let consistency_component = calculate_consistency_component(env, provider);
+    let consistency_component = calculate_consistency_component(performance);
     let stake_component = calculate_stake_component(env, stake_info);
     let follower_component = calculate_follower_component(env, provider);
     let tenure_component = calculate_tenure_component(env, provider, now);
@@ -160,20 +160,22 @@ fn calculate_success_rate_component(performance: &ProviderPerformance) -> u32 {
 /// Calculate consistency component (20% weight)
 /// Measures inverse of ROI variance - lower variance = higher consistency
 /// Returns 0-10000 basis points
-fn calculate_consistency_component(env: &Env, provider: &Address) -> u32 {
-    // For now, return a placeholder based on success rate
-    // In a full implementation, this would calculate ROI variance across signals
-    // Higher consistency = lower variance = higher score
-
-    // Placeholder: use success rate as proxy for consistency
-    // TODO: Implement actual ROI variance calculation
-    let performance = get_provider_performance(env, provider);
+fn calculate_consistency_component(performance: &ProviderPerformance) -> u32 {
     if performance.total_signals < 2 {
         return 5000; // Neutral score for providers with limited history
     }
 
-    // Simple heuristic: higher success rate = higher consistency
-    (performance.success_rate as u64 * 8 / 10) as u32 // Scale to 0-8000, then can add variance penalty
+    // Use success rate plus average return as a proxy for consistency.
+    // In a full implementation, this should be based on variance of individual ROIs.
+    let success_rate = performance.success_rate.min(10000);
+
+    // Normalize avg_return (-10000..10000) to 0..10000
+    let avg_return_clamped = performance.avg_return.max(-10000).min(10000);
+    let avg_return_score = ((avg_return_clamped + 10000) * 10000 / 20000) as u32;
+
+    // Blend success and avg return (60/40) for an approximation of consistency
+    let consistency = (success_rate as u64 * 60 + avg_return_score as u64 * 40) / 100;
+    consistency.min(10000) as u32
 }
 
 /// Calculate stake component (15% weight)
@@ -356,10 +358,22 @@ pub fn update_median_values(env: &Env, median_stake: i128, median_followers: u64
 
 /// Get all trust scores for leaderboard
 pub fn get_all_trust_scores(env: &Env) -> Vec<(Address, TrustScoreDetails)> {
-    // This is a simplified implementation
-    // In practice, you'd need to iterate through all providers
-    // For now, return empty vec - would need proper implementation
-    Vec::new(env)
+    let provider_stats: Map<Address, ProviderPerformance> = env
+        .storage()
+        .persistent()
+        .get(&crate::StorageKey::ProviderStats)
+        .unwrap_or(Map::new(env));
+
+    let mut results = Vec::new(env);
+    for provider in provider_stats.keys() {
+        if let Some(performance) = provider_stats.get(provider.clone()) {
+            let stake_info = crate::stake::get_stake_info(env, &provider);
+            let trust_score = calculate_trust_score(env, &provider, &performance, &stake_info);
+            results.push_back((provider.clone(), trust_score));
+        }
+    }
+
+    results
 }
 
 #[cfg(test)]
@@ -460,5 +474,61 @@ mod tests {
         let component = calculate_tenure_component(&env, &provider, now);
         // 100 days out of 365 = ~27.4% score
         assert_eq!(component, 2739); // Approximately 27.39%
+    }
+
+    #[test]
+    fn test_consistency_component() {
+        // Insufficient history returns neutral 5000
+        let performance = ProviderPerformance {
+            total_signals: 1,
+            ..Default::default()
+        };
+        assert_eq!(calculate_consistency_component(&performance), 5000);
+
+        // Positive returns and strong success rate should increase consistency.
+        let performance = ProviderPerformance {
+            total_signals: 10,
+            success_rate: 8000,
+            avg_return: 5000,
+            ..Default::default()
+        };
+        assert_eq!(calculate_consistency_component(&performance), 7800);
+
+        // Negative returns reduce consistency.
+        let performance = ProviderPerformance {
+            total_signals: 10,
+            success_rate: 5000,
+            avg_return: -8000,
+            ..Default::default()
+        };
+        assert_eq!(calculate_consistency_component(&performance), 3800);
+    }
+
+    #[test]
+    fn test_get_all_trust_scores() {
+        let env = Env::default();
+        let provider = Address::generate(&env);
+
+        let mut provider_stats: Map<Address, ProviderPerformance> = Map::new(&env);
+        provider_stats.set(
+            provider.clone(),
+            ProviderPerformance {
+                total_signals: 5,
+                successful_signals: 4,
+                failed_signals: 1,
+                success_rate: 8000,
+                avg_return: 5000,
+                ..Default::default()
+            },
+        );
+
+        env.storage()
+            .persistent()
+            .set(&crate::StorageKey::ProviderStats, &provider_stats);
+
+        let list = get_all_trust_scores(&env);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list.get(0).unwrap().0, provider);
+        assert_eq!(list.get(0).unwrap().1.has_sufficient_history, true);
     }
 }

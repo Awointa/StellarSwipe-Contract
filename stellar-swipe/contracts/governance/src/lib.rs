@@ -6,6 +6,7 @@ mod conviction_voting;
 mod distribution;
 mod errors;
 mod proposals;
+mod quadratic_voting;
 mod reputation;
 mod timelock;
 mod token;
@@ -64,6 +65,13 @@ pub use token::{HolderAnalytics, HolderBalance, TokenMetadata};
 pub use treasury::{
     Budget, BudgetReport, RebalanceAction, RecurringPayment, Treasury, TreasuryReport,
     TreasurySpend,
+};
+use quadratic_voting::{
+    allocate_vote_credits, cast_quadratic_vote, compare_voting_systems, reallocate_quadratic_votes,
+    refund_credits_on_failure, verify_identity, get_vote_credits, get_quadratic_vote,
+    get_quadratic_voting_config, set_quadratic_voting_config, calculate_marginal_cost,
+    QuadraticVotingConfig, VoteCredits, QuadraticVote, VerificationMethod,
+    VotingComparison,
 };
 
 const DEFAULT_LIQUIDITY_REWARD_BPS: u32 = 100;
